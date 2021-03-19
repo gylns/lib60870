@@ -529,9 +529,6 @@ static int sendIMessage(CS104_Proxy self, uint8_t *buffer, int msgSize) {
   return self->sendCount;
 }
 
-
-
-
 /*
  * Handle received ASDUs
  *
