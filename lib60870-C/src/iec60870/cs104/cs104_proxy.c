@@ -62,6 +62,11 @@ static struct sCS101_AppLayerParameters defaultAppLayerParameters = {
 #endif
 
 typedef struct {
+    uint8_t msg[256];
+    int msgSize;
+} FrameBuffer;
+
+typedef struct {
   uint64_t sentTime; /* required for T1 timeout */
   int seqNo;
 } SentASDUProxy;
@@ -86,26 +91,19 @@ struct sCS104_Proxy {
 
   int connectTimeoutInMs;
 
+  bool waitingForTestFRcon;
+
   SentASDUProxy *sentASDUs; /* the k-buffer */
   uint16_t maxSentASDUs;    /* k-parameter */
   int16_t oldestSentASDU;   /* oldest sent ASDU in k-buffer */
   int16_t newestSentASDU;   /* newest sent ASDU in k-buffer */
-
-#if (CONFIG_USE_SEMAPHORES == 1)
-  Semaphore sentASDUsLock;
-#endif
-
-#if (CONFIG_USE_THREADS == 1)
-  Thread connectionHandlingThread;
-#endif
-
   uint16_t sendCount;    /* sent messages - sequence counter */
   uint16_t receiveCount; /* received messages - sequence counter */
 
   int unconfirmedReceivedIMessages; /* number of unconfirmed messages received
                                      */
                                     /* timeout T2 handling */
-  bool timeoutT2Trigger;
+  bool timeoutT2Triggered;
   uint64_t lastConfirmationTime; /* timestamp when the last confirmation message
                                     (for I messages) was sent */
 
@@ -116,6 +114,14 @@ struct sCS104_Proxy {
   bool running;
   bool failure;
   bool close;
+
+#if (CONFIG_USE_SEMAPHORES == 1)
+  Semaphore sentASDUsLock;
+#endif
+
+#if (CONFIG_USE_THREADS == 1)
+  Thread connectionHandlingThread;
+#endif
 
 #if (CONFIG_CS104_SUPPORT_TLS == 1)
   TLSConfiguration tlsConfig;
@@ -147,69 +153,25 @@ struct sCS104_Proxy {
   void *rawMessageHandlerParameter;
 };
 
-void CS104_Proxy_setInterrogationHandler(CS104_Proxy self,
-                                         CS101_InterrogationHandler handler,
-                                         void *parameter) {
-  self->interrogationHandler = handler;
-  self->interrogationHandlerParameter = parameter;
-}
+static uint8_t STARTDT_CON_MSG[] = { 0x68, 0x04, 0x0b, 0x00, 0x00, 0x00 };
 
-void CS104_Proxy_setCounterInterrogationHandler(
-    CS104_Proxy self, CS101_CounterInterrogationHandler handler,
-    void *parameter) {
-  self->counterInterrogationHandler = handler;
-  self->counterInterrogationHandlerParameter = parameter;
-}
+#define STARTDT_CON_MSG_SIZE 6
 
-void CS104_Proxy_setReadHandler(CS104_Proxy self, CS101_ReadHandler handler,
-                                void *parameter) {
-  self->readHandler = handler;
-  self->readHandlerParameter = parameter;
-}
+static uint8_t STOPDT_CON_MSG[] = { 0x68, 0x04, 0x23, 0x00, 0x00, 0x00 };
 
-void CS104_Proxy_setASDUHandler(CS104_Proxy self, CS101_ASDUHandler handler,
-                                void *parameter) {
-  self->asduHandler = handler;
-  self->asduHandlerParameter = parameter;
-}
+#define STOPDT_CON_MSG_SIZE 6
 
-void CS104_Proxy_setClockSyncHandler(CS104_Proxy self,
-                                     CS101_ClockSynchronizationHandler handler,
-                                     void *parameter) {
-  self->clockSyncHandler = handler;
-  self->clockSyncHandlerParameter = parameter;
-}
+static uint8_t TESTFR_CON_MSG[] = { 0x68, 0x04, 0x83, 0x00, 0x00, 0x00 };
 
-void CS104_Proxy_setRawMessageHandler(CS104_Proxy self,
-                                      IEC60870_RawMessageHandler handler,
-                                      void *parameter) {
-  self->rawMessageHandler = handler;
-  self->rawMessageHandlerParameter = parameter;
-}
+#define TESTFR_CON_MSG_SIZE 6
 
-CS104_APCIParameters CS104_Proxy_getConnectionParameters(CS104_Proxy self) {
-  return &(self->conParameters);
-}
+static uint8_t TESTFR_ACT_MSG[] = { 0x68, 0x04, 0x43, 0x00, 0x00, 0x00 };
 
-CS101_AppLayerParameters CS104_Proxy_getAppLayerParameters(CS104_Proxy self) {
-  return &(self->alParameters);
-}
+#define TESTFR_ACT_MSG_SIZE 6
 
-static int writeToSocket(CS104_Proxy self, uint8_t *buf, int size) {
-  if (self->rawMessageHandler)
-    self->rawMessageHandler(self->rawMessageHandlerParameter, buf, size, true);
-
-#if (CONFIG_CS104_SUPPORT_TLS == 1)
-  if (self->tlsSocket)
-    return TLSSocket_write(self->tlsSocket, buf, size);
-  else
-    return Socket_write(self->socket, buf, size);
-#else
-  return Socket_write(self->socket, buf, size);
-#endif
-}
-
-static CS104_Proxy createProxy(const char *hostname, int tcpPort) {
+static CS104_Proxy
+createProxy(const char *hostname, int tcpPort)
+{
   CS104_Proxy self = (CS104_Proxy)GLOBAL_MALLOC(sizeof(struct sCS104_Proxy));
 
   if (self != NULL) {
@@ -246,15 +208,18 @@ static CS104_Proxy createProxy(const char *hostname, int tcpPort) {
   return self;
 }
 
-CS104_Proxy CS104_Proxy_create(const char *hostname, int tcpPort) {
+CS104_Proxy
+CS104_Proxy_create(const char *hostname, int tcpPort)
+{
   if (tcpPort == -1)
     tcpPort = IEC_60870_5_104_DEFAULT_PORT;
   return createProxy(hostname, tcpPort);
 }
 
 #if (CONFIG_CS104_SUPPORT_TLS == 1)
-CS104_Proxy CS104_Proxy_createSecure(const char *hostname, int tcpPort,
-                                     TLSConfiguration tlsConfig) {
+CS104_Proxy
+CS104_Proxy_createSecure(const char *hostname, int tcpPort, TLSConfiguration tlsConfig)
+{
   if (tcpPort == -1)
     tcpPort = IEC_60870_5_104_DEFAULT_TLS_PORT;
 
@@ -269,108 +234,846 @@ CS104_Proxy CS104_Proxy_createSecure(const char *hostname, int tcpPort,
 }
 #endif /* (CONFIG_CS104_SUPPORT_TLS == 1) */
 
-static void resetT3Timeout(CS104_Proxy self) {
-  self->nextT3Timeout =
-      Hal_getTimeInMs() + (uint64_t)(self->conParameters.t3 * 1000);
+void
+CS104_Proxy_setInterrogationHandler(CS104_Proxy self, CS101_InterrogationHandler handler, void*  parameter)
+{
+    self->interrogationHandler = handler;
+    self->interrogationHandlerParameter = parameter;
 }
 
-static bool checkSequenceNumber(CS104_Proxy self, int seqNo) {
-#if (CONFIG_USE_SEMAPHORES == 1)
-  Semaphore_wait(self->sentASDUsLock);
-#endif
+void
+CS104_Proxy_setCounterInterrogationHandler(CS104_Proxy self, CS101_CounterInterrogationHandler handler, void*  parameter)
+{
+    self->counterInterrogationHandler = handler;
+    self->counterInterrogationHandlerParameter = parameter;
+}
 
-  /* check if received sequence number is valid */
-  bool seqNoIsValid = false;
-  bool counterOverflowDetected = false;
-  int oldestValidSeqNo = -1;
+void
+CS104_Proxy_setReadHandler(CS104_Proxy self, CS101_ReadHandler handler, void* parameter)
+{
+    self->readHandler = handler;
+    self->readHandlerParameter = parameter;
+}
 
-  if (self->oldestSentASDU == -1) { /* if k-Buffer is empty */
-    if (seqNo == self->sendCount)
-      seqNoIsValid = true;
-  } else {
-    /* Two cases are required to reflect sequence number overflow */
-    if (self->sentASDUs[self->oldestSentASDU].seqNo <=
-        self->sentASDUs[self->newestSentASDU].seqNo) {
-      if ((seqNo >= self->sentASDUs[self->oldestSentASDU].seqNo) &&
-          (seqNo <= self->sentASDUs[self->newestSentASDU].seqNo))
-        seqNoIsValid = true;
-    } else {
-      if ((seqNo >= self->sentASDUs[self->oldestSentASDU].seqNo) ||
-          (seqNo <= self->sentASDUs[self->newestSentASDU].seqNo))
-        seqNoIsValid = true;
+void
+CS104_Proxy_setASDUHandler(CS104_Proxy self, CS101_ASDUHandler handler, void* parameter)
+{
+    self->asduHandler = handler;
+    self->asduHandlerParameter = parameter;
+}
 
-      counterOverflowDetected = true;
-    }
+void
+CS104_Proxy_setClockSyncHandler(CS104_Proxy self, CS101_ClockSynchronizationHandler handler, void* parameter)
+{
+    self->clockSyncHandler = handler;
+    self->clockSyncHandlerParameter = parameter;
+}
 
-    /* check if confirmed message was already removed from list */
-    if (self->sentASDUs[self->oldestSentASDU].seqNo == 0)
-      oldestValidSeqNo = 32767;
-    else
-      oldestValidSeqNo =
-          (self->sentASDUs[self->oldestSentASDU].seqNo - 1) % 32768;
+void
+CS104_Proxy_setRawMessageHandler(CS104_Proxy self, IEC60870_RawMessageHandler handler, void* parameter)
+{
+    self->rawMessageHandler = handler;
+    self->rawMessageHandlerParameter = parameter;
+}
 
-    if (oldestValidSeqNo == seqNo)
-      seqNoIsValid = true;
-  }
+CS104_APCIParameters
+CS104_Proxy_getConnectionParameters(CS104_Proxy self)
+{
+    return &(self->conParameters);
+}
 
-  if (seqNoIsValid) {
+CS101_AppLayerParameters
+CS104_Proxy_getAppLayerParameters(CS104_Proxy self)
+{
+    return &(self->alParameters);
+}
 
+void
+CS104_Proxy_setConnectTimeout(CS104_Proxy self, int millies)
+{
+  self->connectTimeoutInMs = millies;
+}
+
+void
+CS104_Proxy_setAPCIParameters(CS104_Proxy self, CS104_APCIParameters parameters)
+{
+  self->conParameters = *parameters;
+  self->connectTimeoutInMs = self->conParameters.t0 * 1000;
+}
+
+void
+CS104_Proxy_setAppLayerParameters(CS104_Proxy self, CS101_AppLayerParameters parameters)
+{
+  self->alParameters = *parameters;
+}
+
+/********************************************************
+ * MasterConnection
+ *********************************************************/
+static void
+printSendBuffer(CS104_Proxy self)
+{
     if (self->oldestSentASDU != -1) {
+        int currentIndex = self->oldestSentASDU;
 
-      do {
-        if (counterOverflowDetected == false) {
-          if (seqNo < self->sentASDUs[self->oldestSentASDU].seqNo)
-            break;
-        }
+        int nextIndex = 0;
 
-        if (seqNo == oldestValidSeqNo)
-          break;
+        DEBUG_PRINT ("CS104 SLAVE: ------k-buffer------\n");
 
-        if (self->sentASDUs[self->oldestSentASDU].seqNo == seqNo) {
-          /* we arrived at the seq# that has been confirmed */
+        do {
+            DEBUG_PRINT("CS104 SLAVE: %02i : SeqNo=%i time=%llu : queueEntry=%p\n", currentIndex,
+                    self->sentASDUs[currentIndex].seqNo,
+                    self->sentASDUs[currentIndex].sentTime,
+                    self->sentASDUs[currentIndex].queueEntry);
 
-          if (self->oldestSentASDU == self->newestSentASDU)
-            self->oldestSentASDU = -1;
-          else
-            self->oldestSentASDU =
-                (self->oldestSentASDU + 1) % self->maxSentASDUs;
+            if (currentIndex == self->newestSentASDU)
+                nextIndex = -1;
+            else
+                currentIndex = (currentIndex + 1) % self->maxSentASDUs;
 
-          break;
-        }
+        } while (nextIndex != -1);
 
-        self->oldestSentASDU = (self->oldestSentASDU + 1) % self->maxSentASDUs;
-
-        int checkIndex = (self->newestSentASDU + 1) % self->maxSentASDUs;
-
-        if (self->oldestSentASDU == checkIndex) {
-          self->oldestSentASDU = -1;
-          break;
-        }
-
-      } while (true);
+        DEBUG_PRINT ("CS104 SLAVE: --------------------\n");
     }
-  }
+    else
+        DEBUG_PRINT("CS104 SLAVE: k-buffer is empty\n");
+}
+
+/**
+ * \return number of bytes read, or -1 in case of an error
+ */
+static int
+readFromSocket(CS104_Proxy self, uint8_t* buffer, int size)
+{
+#if (CONFIG_CS104_SUPPORT_TLS == 1)
+    if (self->tlsSocket != NULL)
+        return TLSSocket_read(self->tlsSocket, buffer, size);
+    else
+        return Socket_read(self->socket, buffer, size);
+#else
+    return Socket_read(self->socket, buffer, size);
+#endif
+}
+
+/**
+ * \brief Read message part into receive buffer
+ *
+ * \return -1 in case of an error, 0 when no complete message can be read, > 0 when a complete message is in buffer
+ */
+static int
+receiveMessage(CS104_Proxy self)
+{
+    uint8_t* buffer = self->recvBuffer;
+    int bufPos = self->recvBufPos;
+
+    /* read start byte */
+    if (bufPos == 0) {
+        int readFirst = readFromSocket(self, buffer, 1);
+
+        if (readFirst < 1)
+            return readFirst;
+
+        if (buffer[0] != 0x68)
+            return -1; /* message error */
+
+        bufPos++;
+    }
+
+    /* read length byte */
+    if (bufPos == 1)  {
+        if (readFromSocket(self, buffer + 1, 1) != 1) {
+            self->recvBufPos = 0;
+            return -1;
+        }
+
+        bufPos++;
+    }
+
+    /* read remaining frame */
+    if (bufPos > 1) {
+        int length = buffer[1];
+
+        int remainingLength = length - bufPos + 2;
+
+        int readCnt = readFromSocket(self, buffer + bufPos, remainingLength);
+
+        if (readCnt == remainingLength) {
+            self->recvBufPos = 0;
+            return length + 2;
+        }
+        else if (readCnt == -1) {
+            self->recvBufPos = 0;
+            return -1;
+        }
+        else {
+            self->recvBufPos = bufPos + readCnt;
+            return 0;
+        }
+    }
+
+    self->recvBufPos = bufPos;
+    return 0;
+}
+
+static int
+writeToSocket(CS104_Proxy self, uint8_t* buf, int size)
+{
+    if (self->rawMessageHandler)
+        self->rawMessageHandler(self->rawMessageHandlerParameter, buf, size, true);
+
+#if (CONFIG_CS104_SUPPORT_TLS == 1)
+    if (self->tlsSocket)
+        return TLSSocket_write(self->tlsSocket, buf, size);
+    else
+        return Socket_write(self->socket, buf, size);
+#else
+    return Socket_write(self->socket, buf, size);
+#endif
+}
+
+static int
+sendIMessage(CS104_Proxy self, uint8_t* buffer, int msgSize)
+{
+    buffer[0] = (uint8_t) 0x68;
+    buffer[1] = (uint8_t) (msgSize - 2);
+
+    buffer[2] = (uint8_t) ((self->sendCount % 128) * 2);
+    buffer[3] = (uint8_t) (self->sendCount / 128);
+
+    buffer[4] = (uint8_t) ((self->receiveCount % 128) * 2);
+    buffer[5] = (uint8_t) (self->receiveCount / 128);
+
+    if (writeToSocket(self, buffer, msgSize) > 0) {
+        DEBUG_PRINT("CS104 SLAVE: SEND I (size = %i) N(S) = %i N(R) = %i\n", msgSize, self->sendCount, self->receiveCount);
+        self->sendCount = (self->sendCount + 1) % 32768;
+        self->unconfirmedReceivedIMessages = 0;
+        self->timeoutT2Triggered = false;
+    }
+
+    self->unconfirmedReceivedIMessages = 0;
+
+    return self->sendCount;
+}
+
+static bool
+isSentBufferFull(CS104_Proxy self)
+{
+    /* locking of k-buffer has to be done by caller! */
+    if (self->oldestSentASDU == -1)
+        return false;
+
+    int newIndex = (self->newestSentASDU + 1) % (self->maxSentASDUs);
+
+    if (newIndex == self->oldestSentASDU)
+        return true;
+    else
+        return false;
+}
+
+
+static void
+sendASDU(CS104_Proxy self, uint8_t* buffer, int msgSize)
+{
+    int currentIndex = 0;
+
+    if (self->oldestSentASDU == -1) {
+        self->oldestSentASDU = 0;
+        self->newestSentASDU = 0;
+    }
+    else {
+        currentIndex = (self->newestSentASDU + 1) % self->maxSentASDUs;
+    }
+
+    self->sentASDUs[currentIndex].seqNo = sendIMessage(self, buffer, msgSize);
+    self->sentASDUs[currentIndex].sentTime = Hal_getTimeInMs();
+
+    self->newestSentASDU = currentIndex;
+
+    printSendBuffer(self);
+}
+
+
+static bool
+sendASDUInternal(CS104_Proxy self, CS101_ASDU asdu)
+{
+    bool asduSent = false;
 
 #if (CONFIG_USE_SEMAPHORES == 1)
-  Semaphore_post(self->sentASDUsLock);
+        Semaphore_wait(self->sentASDUsLock);
 #endif
 
-  return seqNoIsValid;
+    if (isSentBufferFull(self) == false) {
+
+        FrameBuffer frameBuffer;
+
+        struct sBufferFrame bufferFrame;
+
+        Frame frame = BufferFrame_initialize(&bufferFrame, frameBuffer.msg, IEC60870_5_104_APCI_LENGTH);
+        CS101_ASDU_encode(asdu, frame);
+
+        frameBuffer.msgSize = Frame_getMsgSize(frame);
+
+        sendASDU(self, frameBuffer.msg, frameBuffer.msgSize);
+
+        asduSent = true;
+    }
+
+#if (CONFIG_USE_SEMAPHORES == 1)
+        Semaphore_post(self->sentASDUsLock);
+#endif
+
+    if (asduSent == false)
+        DEBUG_PRINT("CS104 SLAVE: unable to send response (isActive=%i)\n", self->isActive);
+
+    return asduSent;
 }
 
-static bool isSentBufferFull(CS104_Proxy self) {
-  if (self->oldestSentASDU == -1)
-    return false;
 
-  int newIndex = (self->newestSentASDU + 1) % self->maxSentASDUs;
+static void
+responseCOTUnknown(CS101_ASDU asdu, CS104_Proxy self)
+{
+    DEBUG_PRINT("CS104 SLAVE:   with unknown COT\n");
+    CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_COT);
+    CS101_ASDU_setNegative(asdu, true);
+    sendASDUInternal(self, asdu);
+}
 
-  if (newIndex == self->oldestSentASDU)
+/*
+ * Handle received ASDUs
+ *
+ * Call the appropriate callbacks according to ASDU type and CoT
+ *
+ * \return true when ASDU is valid, false otherwise (e.g. corrupted message data)
+ */
+static bool
+handleASDU(CS104_Proxy self, CS101_ASDU asdu)
+{
+    bool messageHandled = false;
+
+    CS104_Proxy slave = self;
+
+    uint8_t cot = CS101_ASDU_getCOT(asdu);
+
+    switch (CS101_ASDU_getTypeID(asdu)) {
+
+    case C_IC_NA_1: /* 100 - interrogation command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd interrogation command C_IC_NA_1\n");
+
+        if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_DEACTIVATION)) {
+            if (slave->interrogationHandler != NULL) {
+
+                union uInformationObject _io;
+
+                InterrogationCommand irc = (InterrogationCommand) CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (irc) {
+                    if (slave->interrogationHandler(slave->interrogationHandlerParameter,
+                            &(self->iMasterConnection), asdu, InterrogationCommand_getQOI(irc)))
+                        messageHandled = true;
+                }
+                else
+                    return false;
+
+            }
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_CI_NA_1: /* 101 - counter interrogation command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd counter interrogation command C_CI_NA_1\n");
+
+        if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_DEACTIVATION)) {
+
+            if (slave->counterInterrogationHandler != NULL) {
+
+                union uInformationObject _io;
+
+                CounterInterrogationCommand cic = (CounterInterrogationCommand)  CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (cic) {
+                    if (slave->counterInterrogationHandler(slave->counterInterrogationHandlerParameter,
+                            &(self->iMasterConnection), asdu, CounterInterrogationCommand_getQCC(cic)))
+                        messageHandled = true;
+                }
+                else
+                    return false;
+            }
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_RD_NA_1: /* 102 - read command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd read command C_RD_NA_1\n");
+
+        if (cot == CS101_COT_REQUEST) {
+            if (slave->readHandler != NULL) {
+
+                union uInformationObject _io;
+
+                ReadCommand rc = (ReadCommand) CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (rc) {
+                    if (slave->readHandler(slave->readHandlerParameter,
+                            &(self->iMasterConnection), asdu, InformationObject_getObjectAddress((InformationObject) rc)))
+                        messageHandled = true;
+                }
+                else
+                    return false;
+            }
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_CS_NA_1: /* 103 - Clock synchronization command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd clock sync command C_CS_NA_1\n");
+
+        if (cot == CS101_COT_ACTIVATION) {
+
+            if (slave->clockSyncHandler != NULL) {
+
+                union uInformationObject _io;
+
+                ClockSynchronizationCommand csc = (ClockSynchronizationCommand) CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (csc) {
+                    CP56Time2a newTime = ClockSynchronizationCommand_getTime(csc);
+
+                    if (slave->clockSyncHandler(slave->clockSyncHandlerParameter,
+                            &(self->iMasterConnection), asdu, newTime)) {
+
+                        CS101_ASDU_removeAllElements(asdu);
+
+                        ClockSynchronizationCommand_create(csc, 0, newTime);
+
+                        CS101_ASDU_addInformationObject(asdu, (InformationObject) csc);
+
+                        CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
+
+                        sendASDUInternal(self, asdu);
+                    }
+                    else {
+                        CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
+                        CS101_ASDU_setNegative(asdu, true);
+
+                        sendASDUInternal(self, asdu);
+                    }
+
+                    messageHandled = true;
+                }
+                else
+                    return false;
+            }
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_TS_NA_1: /* 104 - test command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd test command C_TS_NA_1\n");
+
+        if (cot != CS101_COT_ACTIVATION) {
+            CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_COT);
+            CS101_ASDU_setNegative(asdu, true);
+        }
+        else
+            CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
+
+        sendASDUInternal(self, asdu);
+
+        messageHandled = true;
+
+        break;
+
+    case C_RP_NA_1: /* 105 - Reset process command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd reset process command C_RP_NA_1\n");
+
+        if (cot == CS101_COT_ACTIVATION) {
+
+            if (slave->resetProcessHandler != NULL) {
+
+                union uInformationObject _io;
+
+                ResetProcessCommand rpc = (ResetProcessCommand) CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (rpc) {
+                    if (slave->resetProcessHandler(slave->resetProcessHandlerParameter,
+                            &(self->iMasterConnection), asdu, ResetProcessCommand_getQRP(rpc)))
+                        messageHandled = true;
+                }
+                else
+                    return false;
+            }
+
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_CD_NA_1: /* 106 - Delay acquisition command */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd delay acquisition command C_CD_NA_1\n");
+
+        if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_SPONTANEOUS)) {
+
+            if (slave->delayAcquisitionHandler != NULL) {
+
+                union uInformationObject _io;
+
+                DelayAcquisitionCommand dac = (DelayAcquisitionCommand) CS101_ASDU_getElementEx(asdu, (InformationObject) &_io, 0);
+
+                if (dac) {
+                    if (slave->delayAcquisitionHandler(slave->delayAcquisitionHandlerParameter,
+                            &(self->iMasterConnection), asdu, DelayAcquisitionCommand_getDelay(dac)))
+                        messageHandled = true;
+                }
+                else
+                    return false;
+
+            }
+        }
+        else
+            responseCOTUnknown(asdu, self);
+
+        break;
+
+    case C_TS_TA_1: /* 107 - test command with timestamp */
+
+        DEBUG_PRINT("CS104 SLAVE: Rcvd test command with CP56Time2a C_TS_TA_1\n");
+
+        if (cot != CS101_COT_ACTIVATION) {
+            CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_COT);
+            CS101_ASDU_setNegative(asdu, true);
+        }
+        else
+            CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
+
+        sendASDUInternal(self, asdu);
+
+        messageHandled = true;
+
+        break;
+
+
+    default: /* no special handler available -> use default handler */
+        break;
+    }
+
+    if ((messageHandled == false) && (slave->asduHandler != NULL))
+        if (slave->asduHandler(slave->asduHandlerParameter, &(self->iMasterConnection), asdu))
+            messageHandled = true;
+
+    if (messageHandled == false) {
+        /* send error response */
+        CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_TYPE_ID);
+        CS101_ASDU_setNegative(asdu, true);
+        sendASDUInternal(self, asdu);
+    }
+
     return true;
-  else
-    return false;
 }
 
-void CS104_Proxy_close(CS104_Proxy self) {
+static bool
+checkSequenceNumber(CS104_Proxy self, int seqNo)
+{
+#if (CONFIG_USE_SEMAPHORES == 1)
+    Semaphore_wait(self->sentASDUsLock);
+#endif
+
+    /* check if received sequence number is valid */
+
+    bool seqNoIsValid = false;
+    bool counterOverflowDetected = false;
+    int oldestValidSeqNo = -1;
+
+    if (self->oldestSentASDU == -1) { /* if k-Buffer is empty */
+        if (seqNo == self->sendCount)
+            seqNoIsValid = true;
+    }
+    else {
+        /* two cases are required to reflect sequence number overflow */
+        int oldestAsduSeqNo = self->sentASDUs[self->oldestSentASDU].seqNo;
+        int newestAsduSeqNo = self->sentASDUs[self->newestSentASDU].seqNo;
+
+        if (oldestAsduSeqNo <= newestAsduSeqNo) {
+            if ((seqNo >= oldestAsduSeqNo) && (seqNo <= newestAsduSeqNo))
+                seqNoIsValid = true;
+        }
+        else {
+            if ((seqNo >= oldestAsduSeqNo) || (seqNo <= newestAsduSeqNo))
+                seqNoIsValid = true;
+
+            counterOverflowDetected = true;
+        }
+
+        /* check if confirmed message was already removed from list */
+        if (oldestAsduSeqNo == 0)
+            oldestValidSeqNo = 32767;
+        else
+            oldestValidSeqNo = (oldestAsduSeqNo - 1) % 32768;
+
+        if (oldestValidSeqNo == seqNo)
+            seqNoIsValid = true;
+    }
+
+    if (seqNoIsValid) {
+        if (self->oldestSentASDU != -1) {
+
+            do {
+                int oldestAsduSeqNo = self->sentASDUs[self->oldestSentASDU].seqNo;
+
+                if (counterOverflowDetected == false) {
+                    if (seqNo < oldestAsduSeqNo)
+                        break;
+                }
+
+                if (seqNo == oldestValidSeqNo)
+                    break;
+
+                if (oldestAsduSeqNo == seqNo) {
+                    /* we arrived at the seq# that has been confirmed */
+
+                    if (self->oldestSentASDU == self->newestSentASDU)
+                        self->oldestSentASDU = -1;
+                    else
+                        self->oldestSentASDU = (self->oldestSentASDU + 1) % self->maxSentASDUs;
+
+                    break;
+                }
+
+                self->oldestSentASDU = (self->oldestSentASDU + 1) % self->maxSentASDUs;
+
+                int checkIndex = (self->newestSentASDU + 1) % self->maxSentASDUs;
+
+                if (self->oldestSentASDU == checkIndex) {
+                    self->oldestSentASDU = -1;
+                    break;
+                }
+
+            } while (true);
+        }
+    }
+    else
+        DEBUG_PRINT("CS104 SLAVE: Received sequence number out of range");
+
+
+#if (CONFIG_USE_SEMAPHORES == 1)
+    Semaphore_post(self->sentASDUsLock);
+#endif
+
+    return seqNoIsValid;
+}
+
+static void
+resetT3Timeout(CS104_Proxy self, uint64_t currentTime)
+{
+    self->nextT3Timeout = currentTime + (uint64_t) (self->conParameters.t3 * 1000);
+}
+
+static bool
+checkT3Timeout(CS104_Proxy self, uint64_t currentTime)
+{
+    if (self->waitingForTestFRcon)
+        return false;
+
+    if (self->nextT3Timeout > (currentTime + (uint64_t) (self->conParameters.t3 * 1000))) {
+        /* timeout value not plausible (maybe system time changed) */
+        resetT3Timeout(self, currentTime);
+    }
+
+    if (currentTime > self->nextT3Timeout)
+        return true;
+    else
+        return false;
+}
+
+static void
+resetTestFRConTimeout(CS104_Proxy self, uint64_t currentTime)
+{
+    self->nextTestFRConTimeout = currentTime + (uint64_t) (self->conParameters.t1 * 1000);
+}
+
+static bool
+checkTestFRConTimeout(CS104_Proxy self, uint64_t currentTime)
+{
+    if (self->nextTestFRConTimeout > (currentTime + (uint64_t) (self->conParameters.t1 * 1000))) {
+        /* timeout value not plausible (maybe system time changed) */
+        resetTestFRConTimeout(self, currentTime);
+    }
+
+    if (currentTime > self->nextTestFRConTimeout)
+        return true;
+    else
+        return false;
+}
+
+static void
+sendSMessage(CS104_Proxy self)
+{
+    uint8_t msg[6];
+
+    msg[0] = 0x68;
+    msg[1] = 0x04;
+    msg[2] = 0x01;
+    msg[3] = 0;
+    msg[4] = (uint8_t) ((self->receiveCount % 128) * 2);
+    msg[5] = (uint8_t) (self->receiveCount / 128);
+
+    if (writeToSocket(self, msg, 6) < 0) {
+
+    }
+}
+
+static bool
+handleMessage(CS104_Proxy self, uint8_t* buffer, int msgSize)
+{
+    uint64_t currentTime = Hal_getTimeInMs();
+
+    if (msgSize >= 3) {
+
+        if (buffer[0] != 0x68) {
+            DEBUG_PRINT("CS104 SLAVE: Invalid START character!");
+            return false;
+        }
+
+        uint8_t lengthOfApdu = buffer[1];
+
+        if (lengthOfApdu != msgSize - 2) {
+            DEBUG_PRINT("CS104 SLAVE: Invalid length of APDU");
+            return false;
+        }
+
+        if ((buffer[2] & 1) == 0) { /* I message */
+
+            if (msgSize < 7) {
+                DEBUG_PRINT("CS104 SLAVE: Received I msg too small!");
+                return false;
+            }
+
+            if (self->timeoutT2Triggered == false) {
+                self->timeoutT2Triggered = true;
+                self->lastConfirmationTime = currentTime; /* start timeout T2 */
+            }
+
+            int frameSendSequenceNumber = ((buffer [3] * 0x100) + (buffer [2] & 0xfe)) / 2;
+            int frameRecvSequenceNumber = ((buffer [5] * 0x100) + (buffer [4] & 0xfe)) / 2;
+
+            DEBUG_PRINT("CS104 SLAVE: Received I frame: N(S) = %i N(R) = %i\n", frameSendSequenceNumber, frameRecvSequenceNumber);
+
+            if (frameSendSequenceNumber != self->receiveCount) {
+                DEBUG_PRINT("CS104 SLAVE: Sequence error - close connection");
+                return false;
+            }
+
+            if (checkSequenceNumber (self, frameRecvSequenceNumber) == false) {
+                DEBUG_PRINT("CS104 SLAVE: Sequence number check failed - close connection");
+                return false;
+            }
+
+            self->receiveCount = (self->receiveCount + 1) % 32768;
+            self->unconfirmedReceivedIMessages++;
+
+
+            CS101_ASDU asdu = CS101_ASDU_createFromBuffer(&(self->alParameters), buffer + 6, msgSize - 6);
+
+            if (asdu) {
+                bool validAsdu = handleASDU(self, asdu);
+
+                CS101_ASDU_destroy(asdu);
+
+                if (validAsdu == false) {
+                    DEBUG_PRINT("CS104 SLAVE: ASDU corrupted");
+                    return false;
+                }
+            }
+            else {
+                DEBUG_PRINT("CS104 SLAVE: Invalid ASDU");
+                return false;
+            }
+        }
+
+        /* Check for TESTFR_ACT message */
+        else if ((buffer[2] & 0x43) == 0x43) {
+            DEBUG_PRINT("CS104 SLAVE: Send TESTFR_CON\n");
+
+            if (writeToSocket(self, TESTFR_CON_MSG, TESTFR_CON_MSG_SIZE) < 0)
+                return false;
+        }
+
+        /* Check for STARTDT_ACT message */
+        else if ((buffer [2] & 0x07) == 0x07) {
+            DEBUG_PRINT("CS104 SLAVE: Send STARTDT_CON\n");
+
+            if (writeToSocket(self, STARTDT_CON_MSG, STARTDT_CON_MSG_SIZE) < 0)
+                return false;
+        }
+
+        /* Check for STOPDT_ACT message */
+        else if ((buffer [2] & 0x13) == 0x13) {
+            /* Send S-Message to confirm all outstanding messages */
+            self->lastConfirmationTime = Hal_getTimeInMs();
+
+            self->unconfirmedReceivedIMessages = 0;
+
+            self->timeoutT2Triggered = false;
+
+            sendSMessage(self);
+
+            DEBUG_PRINT("CS104 SLAVE: Send STOPDT_CON\n");
+
+            if (writeToSocket(self, STOPDT_CON_MSG, STOPDT_CON_MSG_SIZE) < 0)
+                return false;
+        }
+
+        /* Check for TESTFR_CON message */
+        else if ((buffer[2] & 0x83) == 0x83) {
+            DEBUG_PRINT("CS104 SLAVE: Recv TESTFR_CON\n");
+
+            self->waitingForTestFRcon = false;
+
+            resetT3Timeout(self, currentTime); /* not required here -> is done below! */
+        }
+
+        else if (buffer [2] == 0x01) { /* S-message */
+            int seqNo = (buffer[4] + buffer[5] * 0x100) / 2;
+
+            DEBUG_PRINT("CS104 SLAVE: Rcvd S(%i) (own sendcounter = %i)\n", seqNo, self->sendCount);
+
+            if (checkSequenceNumber(self, seqNo) == false)
+                return false;
+        }
+
+        else {
+            DEBUG_PRINT("CS104 SLAVE: unknown message - IGNORE\n");
+            return true;
+        }
+
+        resetT3Timeout(self, currentTime);
+
+        return true;
+    }
+    else {
+        DEBUG_PRINT("CS104 SLAVE: Invalid message (too small)");
+        return false;
+    }
+}
+
+void
+CS104_Proxy_close(CS104_Proxy self)
+{
   self->close = true;
 #if (CONFIG_USE_THREADS == 1)
   if (self->connectionHandlingThread) {
@@ -380,7 +1083,9 @@ void CS104_Proxy_close(CS104_Proxy self) {
 #endif
 }
 
-void CS104_Proxy_destroy(CS104_Proxy self) {
+void
+CS104_Proxy_destroy(CS104_Proxy self)
+{
   CS104_Proxy_close(self);
 
   if (self->sentASDUs != NULL)
@@ -391,385 +1096,4 @@ void CS104_Proxy_destroy(CS104_Proxy self) {
 #endif
 
   GLOBAL_FREEMEM(self);
-}
-
-void CS104_Proxy_setAPCIParameters(CS104_Proxy self,
-                                   CS104_APCIParameters parameters) {
-  self->conParameters = *parameters;
-
-  self->connectTimeoutInMs = self->conParameters.t0 * 1000;
-}
-
-void CS104_Proxy_setAppLayerParameters(CS104_Proxy self,
-                                       CS101_AppLayerParameters parameters) {
-  self->alParameters = *parameters;
-}
-
-CS101_AppLayerParameters CS104_Proxy_getAppLayerParameters(CS104_Proxy self) {
-  return &(self->alParameters);
-}
-
-void CS104_Proxy_setConnectTimeout(CS104_Proxy self, int millies) {
-  self->connectTimeoutInMs = millies;
-}
-
-CS104_APCIParameters CS104_Proxy_getAPCIParameters(CS104_Proxy self) {
-  return &(self->conParameters);
-}
-
-/**
- * \return number of bytes read, or -1 in case of an error
- */
-static int readFromSocket(CS104_Proxy self, uint8_t *buffer, int size) {
-#if (CONFIG_CS104_SUPPORT_TLS == 1)
-  if (self->tlsSocket != NULL)
-    return TLSSocket_read(self->tlsSocket, buffer, size);
-  else
-    return Socket_read(self->socket, buffer, size);
-#else
-  return Socket_read(self->socket, buffer, size);
-#endif
-}
-
-/**
- * \brief Read message part into receive buffer
- *
- * \return -1 in case of an error, 0 when no complete message can be read, > 0
- * when a complete message is in buffer
- */
-static int receiveMessage(CS104_Proxy self) {
-  uint8_t *buffer = self->recvBuffer;
-  int bufPos = self->recvBufPos;
-
-  /* read start byte */
-  if (bufPos == 0) {
-    int readFirst = readFromSocket(self, buffer, 1);
-
-    if (readFirst < 1)
-      return readFirst;
-
-    if (buffer[0] != 0x68)
-      return -1; /* message error */
-
-    bufPos++;
-  }
-
-  /* read length byte */
-  if (bufPos == 1) {
-
-    int readCnt = readFromSocket(self, buffer + 1, 1);
-
-    if (readCnt < 0) {
-      self->recvBufPos = 0;
-      return -1;
-    } else if (readCnt == 0) {
-      self->recvBufPos = 1;
-      return 0;
-    }
-
-    bufPos++;
-  }
-
-  /* read remaining frame */
-  if (bufPos > 1) {
-    int length = buffer[1];
-
-    int remainingLength = length - bufPos + 2;
-
-    int readCnt = readFromSocket(self, buffer + bufPos, remainingLength);
-
-    if (readCnt == remainingLength) {
-      self->recvBufPos = 0;
-      return length + 2;
-    } else if (readCnt == -1) {
-      self->recvBufPos = 0;
-      return -1;
-    } else {
-      self->recvBufPos = bufPos + readCnt;
-      return 0;
-    }
-  }
-
-  self->recvBufPos = bufPos;
-  return 0;
-}
-
-static bool checkConfirmTimeout(CS104_Proxy self, uint64_t currentTime) {
-  if (currentTime > self->lastConfirmationTime) {
-    if ((currentTime - self->lastConfirmationTime) >=
-        (uint32_t)(self->conParameters.t2 * 1000)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static int sendIMessage(CS104_Proxy self, uint8_t *buffer, int msgSize) {
-  buffer[0] = (uint8_t)0x68;
-  buffer[1] = (uint8_t)(msgSize - 2);
-
-  buffer[2] = (uint8_t)((self->sendCount % 128) * 2);
-  buffer[3] = (uint8_t)(self->sendCount / 128);
-
-  buffer[4] = (uint8_t)((self->receiveCount % 128) * 2);
-  buffer[5] = (uint8_t)(self->receiveCount / 128);
-
-  if (writeToSocket(self, buffer, msgSize) > 0) {
-    DEBUG_PRINT("CS104 SLAVE: SEND I (size = %i) N(S) = %i N(R) = %i\n",
-                msgSize, self->sendCount, self->receiveCount);
-    self->sendCount = (self->sendCount + 1) % 32768;
-    self->unconfirmedReceivedIMessages = 0;
-    self->timeoutT2Trigger = false;
-  } else
-    self->running = false;
-
-  self->unconfirmedReceivedIMessages = 0;
-
-  return self->sendCount;
-}
-
-/*
- * Handle received ASDUs
- *
- * Call the appropriate callbacks according to ASDU type and CoT
- *
- * \return true when ASDU is valid, false otherwise (e.g. corrupted message data)
- */
-static bool handleASDU(CS104_Proxy self, CS101_ASDU asdu) {
-  bool messageHandled = false;
-
-  uint8_t cot = CS101_ASDU_getCOT(asdu);
-
-  switch (CS101_ASDU_getTypeID(asdu)) {
-
-  case C_IC_NA_1: /* 100 - interrogation command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd interrogation command C_IC_NA_1\n");
-
-    if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_DEACTIVATION)) {
-      if (self->interrogationHandler != NULL) {
-
-        union uInformationObject _io;
-
-        InterrogationCommand irc =
-            (InterrogationCommand)CS101_ASDU_getElementEx(
-                asdu, (InformationObject)&_io, 0);
-
-        if (irc) {
-          if (self->interrogationHandler(self->interrogationHandlerParameter,
-                                         &(self->iMasterConnection), asdu,
-                                         InterrogationCommand_getQOI(irc)))
-            messageHandled = true;
-        } else
-          return false;
-      }
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_CI_NA_1: /* 101 - counter interrogation command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd counter interrogation command C_CI_NA_1\n");
-
-    if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_DEACTIVATION)) {
-
-      if (self->counterInterrogationHandler != NULL) {
-
-        union uInformationObject _io;
-
-        CounterInterrogationCommand cic =
-            (CounterInterrogationCommand)CS101_ASDU_getElementEx(
-                asdu, (InformationObject)&_io, 0);
-
-        if (cic) {
-          if (self->counterInterrogationHandler(
-                  self->counterInterrogationHandlerParameter,
-                  &(self->iMasterConnection), asdu,
-                  CounterInterrogationCommand_getQCC(cic)))
-            messageHandled = true;
-        } else
-          return false;
-      }
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_RD_NA_1: /* 102 - read command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd read command C_RD_NA_1\n");
-
-    if (cot == CS101_COT_REQUEST) {
-      if (self->readHandler != NULL) {
-
-        union uInformationObject _io;
-
-        ReadCommand rc = (ReadCommand)CS101_ASDU_getElementEx(
-            asdu, (InformationObject)&_io, 0);
-
-        if (rc) {
-          if (self->readHandler(
-                  self->readHandlerParameter, &(self->iMasterConnection), asdu,
-                  InformationObject_getObjectAddress((InformationObject)rc)))
-            messageHandled = true;
-        } else
-          return false;
-      }
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_CS_NA_1: /* 103 - Clock synchronization command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd clock sync command C_CS_NA_1\n");
-
-    if (cot == CS101_COT_ACTIVATION) {
-
-      if (self->clockSyncHandler != NULL) {
-
-        union uInformationObject _io;
-
-        ClockSynchronizationCommand csc =
-            (ClockSynchronizationCommand)CS101_ASDU_getElementEx(
-                asdu, (InformationObject)&_io, 0);
-
-        if (csc) {
-          CP56Time2a newTime = ClockSynchronizationCommand_getTime(csc);
-
-          if (self->clockSyncHandler(self->clockSyncHandlerParameter,
-                                     &(self->iMasterConnection), asdu,
-                                     newTime)) {
-
-            CS101_ASDU_removeAllElements(asdu);
-
-            ClockSynchronizationCommand_create(csc, 0, newTime);
-
-            CS101_ASDU_addInformationObject(asdu, (InformationObject)csc);
-
-            CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
-
-            sendASDUInternal(self, asdu);
-          } else {
-            CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
-            CS101_ASDU_setNegative(asdu, true);
-
-            sendASDUInternal(self, asdu);
-          }
-
-          messageHandled = true;
-        } else
-          return false;
-      }
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_TS_NA_1: /* 104 - test command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd test command C_TS_NA_1\n");
-
-    if (cot != CS101_COT_ACTIVATION) {
-      CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_COT);
-      CS101_ASDU_setNegative(asdu, true);
-    } else
-      CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
-
-    sendASDUInternal(self, asdu);
-
-    messageHandled = true;
-
-    break;
-
-  case C_RP_NA_1: /* 105 - Reset process command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd reset process command C_RP_NA_1\n");
-
-    if (cot == CS101_COT_ACTIVATION) {
-
-      if (self->resetProcessHandler != NULL) {
-
-        union uInformationObject _io;
-
-        ResetProcessCommand rpc = (ResetProcessCommand)CS101_ASDU_getElementEx(
-            asdu, (InformationObject)&_io, 0);
-
-        if (rpc) {
-          if (self->resetProcessHandler(self->resetProcessHandlerParameter,
-                                        &(self->iMasterConnection), asdu,
-                                        ResetProcessCommand_getQRP(rpc)))
-            messageHandled = true;
-        } else
-          return false;
-      }
-
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_CD_NA_1: /* 106 - Delay acquisition command */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd delay acquisition command C_CD_NA_1\n");
-
-    if ((cot == CS101_COT_ACTIVATION) || (cot == CS101_COT_SPONTANEOUS)) {
-
-      if (self->delayAcquisitionHandler != NULL) {
-
-        union uInformationObject _io;
-
-        DelayAcquisitionCommand dac =
-            (DelayAcquisitionCommand)CS101_ASDU_getElementEx(
-                asdu, (InformationObject)&_io, 0);
-
-        if (dac) {
-          if (self->delayAcquisitionHandler(
-                  self->delayAcquisitionHandlerParameter,
-                  &(self->iMasterConnection), asdu,
-                  DelayAcquisitionCommand_getDelay(dac)))
-            messageHandled = true;
-        } else
-          return false;
-      }
-    } else
-      responseCOTUnknown(asdu, self);
-
-    break;
-
-  case C_TS_TA_1: /* 107 - test command with timestamp */
-
-    DEBUG_PRINT("CS104 SLAVE: Rcvd test command with CP56Time2a C_TS_TA_1\n");
-
-    if (cot != CS101_COT_ACTIVATION) {
-      CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_COT);
-      CS101_ASDU_setNegative(asdu, true);
-    } else
-      CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
-
-    sendASDUInternal(self, asdu);
-
-    messageHandled = true;
-
-    break;
-
-  default: /* no special handler available -> use default handler */
-    break;
-  }
-
-  if ((messageHandled == false) && (self->asduHandler != NULL))
-    if (self->asduHandler(self->asduHandlerParameter,
-                          &(self->iMasterConnection), asdu))
-      messageHandled = true;
-
-  if (messageHandled == false) {
-    /* send error response */
-    CS101_ASDU_setCOT(asdu, CS101_COT_UNKNOWN_TYPE_ID);
-    CS101_ASDU_setNegative(asdu, true);
-    sendASDUInternal(self, asdu);
-  }
-
-  return true;
 }
