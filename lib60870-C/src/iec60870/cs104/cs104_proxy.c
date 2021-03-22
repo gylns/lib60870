@@ -169,71 +169,6 @@ static uint8_t TESTFR_ACT_MSG[] = { 0x68, 0x04, 0x43, 0x00, 0x00, 0x00 };
 
 #define TESTFR_ACT_MSG_SIZE 6
 
-static CS104_Proxy
-createProxy(const char *hostname, int tcpPort)
-{
-  CS104_Proxy self = (CS104_Proxy)GLOBAL_MALLOC(sizeof(struct sCS104_Proxy));
-
-  if (self != NULL) {
-    strncpy(self->hostname, hostname, HOST_NAME_MAX);
-    self->tcpPort = tcpPort;
-
-    self->conParameters = defaultConnectionParameters;
-    self->alParameters = defaultAppLayerParameters;
-
-    self->asduHandler = NULL;
-    self->interrogationHandler = NULL;
-    self->counterInterrogationHandler = NULL;
-    self->readHandler = NULL;
-    self->clockSyncHandler = NULL;
-    self->resetProcessHandler = NULL;
-    self->delayAcquisitionHandler = NULL;
-    self->rawMessageHandler = NULL;
-
-#if (CONFIG_USE_SEMAPHORES == 1)
-    self->sentASDUsLock = Semaphore_create(1);
-#endif
-
-#if (CONFIG_USE_THREADS == 1)
-    self->connectionHandlingThread = NULL;
-#endif
-
-#if (CONFIG_CS104_SUPPORT_TLS == 1)
-    self->tlsConfig = NULL;
-    self->tlsSocket = NULL;
-#endif
-
-    self->sentASDUs = NULL;
-  }
-  return self;
-}
-
-CS104_Proxy
-CS104_Proxy_create(const char *hostname, int tcpPort)
-{
-  if (tcpPort == -1)
-    tcpPort = IEC_60870_5_104_DEFAULT_PORT;
-  return createProxy(hostname, tcpPort);
-}
-
-#if (CONFIG_CS104_SUPPORT_TLS == 1)
-CS104_Proxy
-CS104_Proxy_createSecure(const char *hostname, int tcpPort, TLSConfiguration tlsConfig)
-{
-  if (tcpPort == -1)
-    tcpPort = IEC_60870_5_104_DEFAULT_TLS_PORT;
-
-  CS104_Proxy self = createConnection(hostname, tcpPort);
-
-  if (self != NULL) {
-    self->tlsConfig = tlsConfig;
-    TLSConfiguration_setClientMode(tlsConfig);
-  }
-
-  return self;
-}
-#endif /* (CONFIG_CS104_SUPPORT_TLS == 1) */
-
 void
 CS104_Proxy_setInterrogationHandler(CS104_Proxy self, CS101_InterrogationHandler handler, void*  parameter)
 {
@@ -1070,6 +1005,163 @@ handleMessage(CS104_Proxy self, uint8_t* buffer, int msgSize)
         return false;
     }
 }
+
+/********************************************
+ * IMasterConnection
+ *******************************************/
+
+static bool
+_IMasterConnection_isReady(IMasterConnection self)
+{
+    CS104_Proxy con = (CS104_Proxy) self->object;
+
+    if (isSentBufferFull(con) == false)
+      return true;
+    else
+      return false;
+}
+
+static bool
+_IMasterConnection_sendASDU(IMasterConnection self, CS101_ASDU asdu)
+{
+    CS104_Proxy con = (CS104_Proxy) self->object;
+
+    return sendASDUInternal(con, asdu);
+}
+
+static bool
+_IMasterConnection_sendACT_CON(IMasterConnection self, CS101_ASDU asdu, bool negative)
+{
+    CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_CON);
+    CS101_ASDU_setNegative(asdu, negative);
+
+    return _IMasterConnection_sendASDU(self, asdu);
+}
+
+static bool
+_IMasterConnection_sendACT_TERM(IMasterConnection self, CS101_ASDU asdu)
+{
+    CS101_ASDU_setCOT(asdu, CS101_COT_ACTIVATION_TERMINATION);
+    CS101_ASDU_setNegative(asdu, false);
+
+    return _IMasterConnection_sendASDU(self, asdu);
+}
+
+static void
+_IMasterConnection_close(IMasterConnection self)
+{
+    CS104_Proxy con = (CS104_Proxy) self->object;
+
+    CS104_Proxy_close(con);
+}
+
+static int
+_IMasterConnection_getPeerAddress(IMasterConnection self, char* addrBuf, int addrBufSize)
+{
+    CS104_Proxy con = (CS104_Proxy) self->object;
+
+    char buf[50];
+
+    char* addrStr = Socket_getPeerAddressStatic(con->socket, buf);
+
+    if (addrStr == NULL)
+        return 0;
+
+    int len = (int) strlen(buf);
+
+    if (len < addrBufSize) {
+        strcpy(addrBuf, buf);
+        return len;
+    }
+    else
+        return 0;
+}
+
+static CS101_AppLayerParameters
+_IMasterConnection_getApplicationLayerParameters(IMasterConnection self)
+{
+    CS104_Proxy con = (CS104_Proxy) self->object;
+
+    return &(con->alParameters);
+}
+
+/********************************************
+ * END IMasterConnection
+ *******************************************/
+static CS104_Proxy
+createProxy(const char *hostname, int tcpPort)
+{
+  CS104_Proxy self = (CS104_Proxy)GLOBAL_MALLOC(sizeof(struct sCS104_Proxy));
+
+  if (self != NULL) {
+    strncpy(self->hostname, hostname, HOST_NAME_MAX);
+    self->tcpPort = tcpPort;
+
+    self->conParameters = defaultConnectionParameters;
+    self->alParameters = defaultAppLayerParameters;
+
+    self->asduHandler = NULL;
+    self->interrogationHandler = NULL;
+    self->counterInterrogationHandler = NULL;
+    self->readHandler = NULL;
+    self->clockSyncHandler = NULL;
+    self->resetProcessHandler = NULL;
+    self->delayAcquisitionHandler = NULL;
+    self->rawMessageHandler = NULL;
+
+#if (CONFIG_USE_SEMAPHORES == 1)
+    self->sentASDUsLock = Semaphore_create(1);
+#endif
+
+#if (CONFIG_USE_THREADS == 1)
+    self->connectionHandlingThread = NULL;
+#endif
+
+#if (CONFIG_CS104_SUPPORT_TLS == 1)
+    self->tlsConfig = NULL;
+    self->tlsSocket = NULL;
+#endif
+
+    self->maxSentASDUs = self->conParameters.k;
+    self->sentASDUs = (SentASDUProxy*) GLOBAL_CALLOC(self->maxSentASDUs, sizeof(SentASDUProxy));;
+
+    self->iMasterConnection.object = self;
+    self->iMasterConnection.getApplicationLayerParameters = _IMasterConnection_getApplicationLayerParameters;
+    self->iMasterConnection.isReady = _IMasterConnection_isReady;
+    self->iMasterConnection.sendASDU = _IMasterConnection_sendASDU;
+    self->iMasterConnection.sendACT_CON = _IMasterConnection_sendACT_CON;
+    self->iMasterConnection.sendACT_TERM = _IMasterConnection_sendACT_TERM;
+    self->iMasterConnection.close = _IMasterConnection_close;
+    self->iMasterConnection.getPeerAddress = _IMasterConnection_getPeerAddress;
+  }
+  return self;
+}
+
+CS104_Proxy
+CS104_Proxy_create(const char *hostname, int tcpPort)
+{
+  if (tcpPort == -1)
+    tcpPort = IEC_60870_5_104_DEFAULT_PORT;
+  return createProxy(hostname, tcpPort);
+}
+
+#if (CONFIG_CS104_SUPPORT_TLS == 1)
+CS104_Proxy
+CS104_Proxy_createSecure(const char *hostname, int tcpPort, TLSConfiguration tlsConfig)
+{
+  if (tcpPort == -1)
+    tcpPort = IEC_60870_5_104_DEFAULT_TLS_PORT;
+
+  CS104_Proxy self = createConnection(hostname, tcpPort);
+
+  if (self != NULL) {
+    self->tlsConfig = tlsConfig;
+    TLSConfiguration_setClientMode(tlsConfig);
+  }
+
+  return self;
+}
+#endif /* (CONFIG_CS104_SUPPORT_TLS == 1) */
 
 void
 CS104_Proxy_close(CS104_Proxy self)
