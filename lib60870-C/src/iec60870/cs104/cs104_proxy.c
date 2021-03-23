@@ -111,9 +111,10 @@ struct sCS104_Proxy {
   uint64_t nextTestFRConTimeout; /* timeout T1 when waiting for TEST FR con */
 
   Socket socket;
-  bool running;
-  bool failure;
-  bool close;
+  HandleSet handleSet;
+
+  bool isRunning;
+  bool isConnected;
 
 #if (CONFIG_USE_SEMAPHORES == 1)
   Semaphore sentASDUsLock;
@@ -151,6 +152,9 @@ struct sCS104_Proxy {
 
   IEC60870_RawMessageHandler rawMessageHandler;
   void *rawMessageHandlerParameter;
+
+  CS104_ProxyConnectionHandler connectionEventHandler;
+  void* connectionEventHandlerParameter;
 };
 
 static uint8_t STARTDT_CON_MSG[] = { 0x68, 0x04, 0x0b, 0x00, 0x00, 0x00 };
@@ -209,6 +213,13 @@ CS104_Proxy_setRawMessageHandler(CS104_Proxy self, IEC60870_RawMessageHandler ha
 {
     self->rawMessageHandler = handler;
     self->rawMessageHandlerParameter = parameter;
+}
+
+void
+CS104_Proxy_setConnectionEventHandler(CS104_Proxy self,  CS104_ProxyConnectionHandler handler, void* parameter)
+{
+    self->connectionEventHandler = handler;
+    self->connectionEventHandlerParameter = parameter;
 }
 
 CS104_APCIParameters
@@ -1097,7 +1108,11 @@ createProxy(const char *hostname, int tcpPort)
     strncpy(self->hostname, hostname, HOST_NAME_MAX);
     self->tcpPort = tcpPort;
 
+    self->isRunning = false;
+    self->isConnected = false;
+
     self->conParameters = defaultConnectionParameters;
+    self->connectTimeoutInMs  = self->conParameters.t0 * 1000;
     self->alParameters = defaultAppLayerParameters;
 
     self->asduHandler = NULL;
@@ -1121,6 +1136,8 @@ createProxy(const char *hostname, int tcpPort)
     self->tlsConfig = NULL;
     self->tlsSocket = NULL;
 #endif
+
+    self->socket = TcpSocket_create();
 
     self->maxSentASDUs = self->conParameters.k;
     self->sentASDUs = (SentASDUProxy*) GLOBAL_CALLOC(self->maxSentASDUs, sizeof(SentASDUProxy));;
@@ -1152,7 +1169,7 @@ CS104_Proxy_createSecure(const char *hostname, int tcpPort, TLSConfiguration tls
   if (tcpPort == -1)
     tcpPort = IEC_60870_5_104_DEFAULT_TLS_PORT;
 
-  CS104_Proxy self = createConnection(hostname, tcpPort);
+  CS104_Proxy self = createProxy(hostname, tcpPort);
 
   if (self != NULL) {
     self->tlsConfig = tlsConfig;
@@ -1166,12 +1183,13 @@ CS104_Proxy_createSecure(const char *hostname, int tcpPort, TLSConfiguration tls
 void
 CS104_Proxy_close(CS104_Proxy self)
 {
-  self->close = true;
 #if (CONFIG_USE_THREADS == 1)
-  if (self->connectionHandlingThread) {
-    Thread_destroy(self->connectionHandlingThread);
-    self->connectionHandlingThread = NULL;
-  }
+    if (self->connectionHandlingThread) {
+
+        Thread_destroy(self->connectionHandlingThread);
+
+        self->connectionHandlingThread = NULL;
+    }
 #endif
 }
 
@@ -1188,4 +1206,129 @@ CS104_Proxy_destroy(CS104_Proxy self)
 #endif
 
   GLOBAL_FREEMEM(self);
+}
+
+static void
+handleTcpConnection(CS104_Proxy self)
+{
+    int bytesRec = receiveMessage(self);
+
+    if (bytesRec < 0) {
+        DEBUG_PRINT("CS104 SLAVE: Error reading from socket\n");
+        self->isConnected = false;
+    }
+
+    if (bytesRec > 0) {
+
+        if (self->rawMessageHandler)
+            self->rawMessageHandler(self->rawMessageHandlerParameter, self->recvBuffer, bytesRec, false);
+
+        if (handleMessage(self, self->recvBuffer, bytesRec) == false)
+            self->isConnected = false;
+
+        if (self->unconfirmedReceivedIMessages >= self->conParameters.w) {
+
+            self->lastConfirmationTime = Hal_getTimeInMs();
+
+            self->unconfirmedReceivedIMessages = 0;
+
+            self->timeoutT2Triggered = false;
+
+            sendSMessage(self);
+        }
+    }
+}
+
+static void
+executePeriodicTasks(CS104_Proxy self)
+{
+    (void)self;
+}
+
+static void
+handleClientConnections(CS104_Proxy self)
+{
+    HandleSet handleset = NULL;
+
+    if (self->isConnected) {
+
+        handleset = self->handleSet;
+        Handleset_reset(handleset);
+
+        Handleset_addSocket(handleset, self->socket);
+
+        /* handle incoming messages when available */
+        if (handleset != NULL) {
+
+            if (Handleset_waitReady(handleset, 1)) {
+
+                handleTcpConnection(self);
+            }
+        }
+
+        /* handle periodic tasks for running connections */
+        executePeriodicTasks(self);
+
+        if (!self->isConnected) {
+
+            if (self->connectionEventHandler != NULL) {
+                self->connectionEventHandler(self->connectionEventHandlerParameter, self, CS104_PROXY_CONNECTION_CLOSED);
+            }
+            DEBUG_PRINT("CS104 SLAVE: Connection closed\n");
+        }
+
+    }
+}
+
+/* handle TCP connections in non-threaded mode */
+static void
+handleConnectionsThreadless(CS104_Proxy self)
+{
+    if (self->isRunning) {
+
+        if (self->isConnected) {
+
+            handleClientConnections(self);
+        }
+        else {
+
+            Socket_setConnectTimeout(self->socket, self->connectTimeoutInMs);
+
+            // connect to master
+            if (Socket_connect(self->socket, self->hostname, self->tcpPort)) {
+#if (CONFIG_CS104_SUPPORT_TLS == 1)
+                if (self->tlsConfig != NULL) {
+                    self->tlsSocket = TLSSocket_create(self->socket, self->tlsConfig, false);
+
+                    if (self->tlsSocket)
+                        self->isConnected = true;
+                    else
+                        self->isConnected = false;
+                }
+                else
+                    self->isConnected = true;
+#else
+                self->isConnected = true;
+#endif
+            }
+
+            if (self->isConnected) {
+
+                if (self->connectionEventHandler != NULL)
+                    self->connectionEventHandler(self->connectionEventHandler, self, CS104_PROXY_CONNECTION_OPENED);
+            }
+        }
+    }
+}
+
+void
+CS104_Proxy_tick(CS104_Proxy self)
+{
+    handleConnectionsThreadless(self);
+}
+
+void
+CS104_Proxy_startThreadless(CS104_Proxy self)
+{
+    self->isRunning = true;
 }

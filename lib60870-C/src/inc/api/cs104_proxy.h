@@ -32,6 +32,20 @@ extern "C" {
 
 typedef struct sCS104_Proxy *CS104_Proxy;
 
+typedef enum {
+    CS104_PROXY_CONNECTION_OPENED = 0,
+    CS104_PROXY_CONNECTION_CLOSED = 1,
+} CS104_ProxyConnectionEvent;
+
+/**
+ * \brief Handler that is called when the connection is established or closed
+ *
+ * \param parameter user provided parameter
+ * \param connection the connection object
+ * \param event event type
+ */
+typedef void (*CS104_ProxyConnectionHandler) (void* parameter, CS104_Proxy connection, CS104_ProxyConnectionEvent event);
+
 /**
  * \brief Create a new instance of a CS104 slave (server)
  *
@@ -82,6 +96,9 @@ CS104_Proxy_setClockSyncHandler(CS104_Proxy self, CS101_ClockSynchronizationHand
 void
 CS104_Proxy_setRawMessageHandler(CS104_Proxy self, IEC60870_RawMessageHandler handler, void* parameter);
 
+void
+CS104_Proxy_setConnectionEventHandler(CS104_Proxy self,  CS104_ProxyConnectionHandler handler, void* parameter);
+
 /**
  * \brief Get the APCI parameters instance. APCI parameters are CS 104 specific parameters.
  */
@@ -108,6 +125,12 @@ CS104_Proxy_close(CS104_Proxy self);
 
 void
 CS104_Proxy_destroy(CS104_Proxy self);
+
+void
+CS104_Proxy_tick(CS104_Proxy self);
+
+void
+CS104_Proxy_startThreadless(CS104_Proxy self);
 
 #ifdef __cplusplus
 }

@@ -67,6 +67,7 @@ LIB_API_HEADER_FILES += src/inc/api/cs101_master.h
 LIB_API_HEADER_FILES += src/inc/api/cs101_slave.h
 LIB_API_HEADER_FILES += src/inc/api/cs104_connection.h
 LIB_API_HEADER_FILES += src/inc/api/cs104_slave.h
+LIB_API_HEADER_FILES += src/inc/api/cs104_proxy.h
 LIB_API_HEADER_FILES += src/inc/api/iec60870_common.h
 LIB_API_HEADER_FILES += src/inc/api/iec60870_master.h
 LIB_API_HEADER_FILES += src/inc/api/iec60870_slave.h
@@ -149,4 +150,3 @@ install:	$(LIB_NAME)
 clean:
 	rm -f $(EXAMPLES)
 	rm -rf $(LIB_OBJS_DIR)
-
