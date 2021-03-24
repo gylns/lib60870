@@ -267,10 +267,9 @@ printSendBuffer(CS104_Proxy self)
         DEBUG_PRINT ("CS104 SLAVE: ------k-buffer------\n");
 
         do {
-            DEBUG_PRINT("CS104 SLAVE: %02i : SeqNo=%i time=%llu : queueEntry=%p\n", currentIndex,
+            DEBUG_PRINT("CS104 SLAVE: %02i : SeqNo=%i time=%llu\n", currentIndex,
                     self->sentASDUs[currentIndex].seqNo,
-                    self->sentASDUs[currentIndex].sentTime,
-                    self->sentASDUs[currentIndex].queueEntry);
+                    self->sentASDUs[currentIndex].sentTime);
 
             if (currentIndex == self->newestSentASDU)
                 nextIndex = -1;
@@ -469,7 +468,7 @@ sendASDUInternal(CS104_Proxy self, CS101_ASDU asdu)
 #endif
 
     if (asduSent == false)
-        DEBUG_PRINT("CS104 SLAVE: unable to send response (isActive=%i)\n", self->isActive);
+        DEBUG_PRINT("CS104 SLAVE: unable to send response\n");
 
     return asduSent;
 }
@@ -1138,6 +1137,7 @@ createProxy(const char *hostname, int tcpPort)
 #endif
 
     self->socket = TcpSocket_create();
+    self->handleSet = Handleset_new();
 
     self->maxSentASDUs = self->conParameters.k;
     self->sentASDUs = (SentASDUProxy*) GLOBAL_CALLOC(self->maxSentASDUs, sizeof(SentASDUProxy));;
@@ -1315,7 +1315,7 @@ handleConnectionsThreadless(CS104_Proxy self)
             if (self->isConnected) {
 
                 if (self->connectionEventHandler != NULL)
-                    self->connectionEventHandler(self->connectionEventHandler, self, CS104_PROXY_CONNECTION_OPENED);
+                    self->connectionEventHandler(self->connectionEventHandlerParameter, self, CS104_PROXY_CONNECTION_OPENED);
             }
         }
     }
@@ -1331,4 +1331,10 @@ void
 CS104_Proxy_startThreadless(CS104_Proxy self)
 {
     self->isRunning = true;
+}
+
+Socket
+CS104_Proxy_getSocket(CS104_Proxy self)
+{
+    return self->socket;
 }

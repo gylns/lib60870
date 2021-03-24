@@ -25,6 +25,7 @@
 #define SRC_INC_API_CS104_PROXY_H_
 
 #include "iec60870_slave.h"
+#include "hal_socket.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,6 +132,9 @@ CS104_Proxy_tick(CS104_Proxy self);
 
 void
 CS104_Proxy_startThreadless(CS104_Proxy self);
+
+Socket
+CS104_Proxy_getSocket(CS104_Proxy self);
 
 #ifdef __cplusplus
 }
